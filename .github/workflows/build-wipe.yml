@@ -1,0 +1,93 @@
+name: Build Wipe-only Firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build_wipe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake gcc-arm-none-eabi build-essential
+
+      - name: Clone Pico SDK
+        run: |
+          git clone https://github.com/raspberrypi/pico-sdk.git
+          cd pico-sdk
+          git submodule update --init
+          echo "PICO_SDK_PATH=$PWD" >> $GITHUB_ENV
+
+      # ------------------------------
+      # 生成 wipe 固件源文件
+      # ------------------------------
+      - name: Generate wipe source
+        run: |
+          mkdir -p wipe_build
+          cd wipe_build
+
+          cat > wipe_main.c << 'EOF'
+          #include "pico/stdlib.h"
+          #include "hardware/watchdog.h"
+
+          #include "../storage.h"
+          #include "../pin.h"
+          #include "../uv.h"
+
+          int main(void) {
+              sleep_ms(50);
+              storage_erase_all();
+              pin_reset();
+              uv_reset();
+              sleep_ms(50);
+              watchdog_reboot(0,0,0);
+              while(1) { __wfi(); }
+          }
+          EOF
+
+          cat > CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.13)
+          include(pico_sdk_import.cmake)
+          project(pico_fido_wipe_project)
+
+          pico_sdk_init()
+
+          add_executable(pico_fido_wipe wipe_main.c)
+
+          target_link_libraries(pico_fido_wipe
+              pico_stdlib
+              hardware_watchdog
+              storage
+          )
+
+          pico_add_extra_outputs(pico_fido_wipe)
+          EOF
+
+      # ------------------------------
+      # 编译 wipe 固件
+      # ------------------------------
+      - name: Configure wipe firmware
+        run: |
+          cd wipe_build
+          cmake -DPICO_BOARD=pico2 -DPICO_PLATFORM=rp2350 .
+
+      - name: Build wipe firmware
+        run: |
+          cd wipe_build
+          make -j$(nproc)
+
+      # ------------------------------
+      # 上传结果
+      # ------------------------------
+      - name: Upload wipe firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico_fido_wipe
+          path: wipe_build/*.uf2
