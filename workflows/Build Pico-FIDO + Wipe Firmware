@@ -1,0 +1,122 @@
+name: Build Pico-FIDO + Wipe Firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake gcc-arm-none-eabi build-essential
+
+      - name: Clone pico-sdk
+        run: |
+          git clone https://github.com/raspberrypi/pico-sdk.git
+          cd pico-sdk
+          git submodule update --init
+          echo "PICO_SDK_PATH=$PWD" >> $GITHUB_ENV
+
+      # =====================================================
+      # Build Normal FIDO Firmware (pico_fido.uf2)
+      # =====================================================
+      - name: Configure normal firmware
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DPICO_BOARD=pico2 \
+            -DPICO_PLATFORM=rp2350 \
+            -DVIDPID=Yubikey5
+
+      - name: Build normal firmware
+        run: |
+          cd build
+          make -j$(nproc)
+
+      # =====================================================
+      # Build Wipe-only Firmware
+      # =====================================================
+
+      # 1) Inject wipe code
+      - name: Inject wipe-only source
+        run: |
+          mkdir -p wipe
+
+          cat > wipe/wipe_main.c << 'EOF'
+          #include "pico/stdlib.h"
+          #include "hardware/watchdog.h"
+
+          // 来自 pico-fido 的 storage/pin/uv 接口
+          #include "storage.h"
+          #include "pin.h"
+          #include "uv.h"
+
+          int main(void) {
+              sleep_ms(50);
+
+              // 擦除所有 Flash 内存 (resident keys, PIN, UV, OATH, etc)
+              storage_erase_all();
+
+              // 重置 PIN / UV
+              pin_reset();
+              uv_reset();
+
+              // 等待 flash 写入
+              sleep_ms(50);
+
+              // 立即复位
+              watchdog_reboot(0, 0, 0);
+
+              while (1) { __wfi(); }
+          }
+          EOF
+
+          cat > wipe/CMakeLists.txt << 'EOF'
+          add_executable(pico_fido_wipe
+              wipe_main.c
+          )
+
+          target_link_libraries(pico_fido_wipe
+              pico_stdlib
+              hardware_watchdog
+              storage
+          )
+
+          pico_add_extra_outputs(pico_fido_wipe)
+          EOF
+
+      # 2) Build wipe firmware
+      - name: Configure wipe firmware
+        run: |
+          mkdir -p wipe_build
+          cd wipe_build
+          cmake .. \
+            -DPICO_BOARD=pico2 \
+            -DPICO_PLATFORM=rp2350 \
+            -DWIPER=ON
+
+      - name: Build wipe firmware
+        run: |
+          cd wipe_build
+          make pico_fido_wipe -j$(nproc)
+
+      # =====================================================
+      # Upload Artifacts
+      # =====================================================
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-fido-artifacts
+          path: |
+            build/*.uf2
+            wipe_build/*.uf2
