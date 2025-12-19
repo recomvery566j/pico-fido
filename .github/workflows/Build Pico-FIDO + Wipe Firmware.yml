@@ -8,17 +8,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      - name: Checkout source
+      # -------------------------------
+      # 1. Checkout source
+      # -------------------------------
+      - name: Checkout pico-fido
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      # -------------------------------
+      # 2. Install toolchain
+      # -------------------------------
       - name: Install toolchain dependencies
         run: |
           sudo apt update
           sudo apt install -y cmake gcc-arm-none-eabi build-essential
 
+      # -------------------------------
+      # 3. Clone Pico SDK
+      # -------------------------------
       - name: Clone pico-sdk
         run: |
           git clone https://github.com/raspberrypi/pico-sdk.git
@@ -27,7 +35,7 @@ jobs:
           echo "PICO_SDK_PATH=$PWD" >> $GITHUB_ENV
 
       # =====================================================
-      # Build Normal FIDO Firmware (pico_fido.uf2)
+      # 4. Build Normal Firmware (pico_fido.uf2)
       # =====================================================
       - name: Configure normal firmware
         run: |
@@ -44,44 +52,46 @@ jobs:
           make -j$(nproc)
 
       # =====================================================
-      # Build Wipe-only Firmware
+      # 5. Build Wipe-only Firmware (独立构建)
       # =====================================================
-
-      # 1) Inject wipe code
-      - name: Inject wipe-only source
+      - name: Create wipe source
         run: |
-          mkdir -p wipe
-
-          cat > wipe/wipe_main.c << 'EOF'
+          mkdir -p wipe_build/wipe
+          cat > wipe_build/wipe/wipe_main.c << 'EOF'
           #include "pico/stdlib.h"
           #include "hardware/watchdog.h"
 
-          // 来自 pico-fido 的 storage/pin/uv 接口
-          #include "storage.h"
-          #include "pin.h"
-          #include "uv.h"
+          // 来自 pico-fido 的接口
+          #include "../../storage.h"
+          #include "../../pin.h"
+          #include "../../uv.h"
 
           int main(void) {
               sleep_ms(50);
 
-              // 擦除所有 Flash 内存 (resident keys, PIN, UV, OATH, etc)
+              // 擦除 Flash 中所有 FIDO 数据
               storage_erase_all();
 
-              // 重置 PIN / UV
+              // 清 PIN / UV
               pin_reset();
               uv_reset();
 
-              // 等待 flash 写入
               sleep_ms(50);
 
-              // 立即复位
-              watchdog_reboot(0, 0, 0);
+              // 强制复位
+              watchdog_reboot(0,0,0);
 
               while (1) { __wfi(); }
           }
           EOF
 
-          cat > wipe/CMakeLists.txt << 'EOF'
+          cat > wipe_build/wipe/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.13)
+          include(pico_sdk_import.cmake)
+          project(pico_fido_wipe_project)
+
+          pico_sdk_init()
+
           add_executable(pico_fido_wipe
               wipe_main.c
           )
@@ -95,15 +105,10 @@ jobs:
           pico_add_extra_outputs(pico_fido_wipe)
           EOF
 
-      # 2) Build wipe firmware
       - name: Configure wipe firmware
         run: |
-          mkdir -p wipe_build
           cd wipe_build
-          cmake .. \
-            -DPICO_BOARD=pico2 \
-            -DPICO_PLATFORM=rp2350 \
-            -DWIPER=ON
+          cmake -DPICO_BOARD=pico2 -DPICO_PLATFORM=rp2350 .
 
       - name: Build wipe firmware
         run: |
@@ -111,7 +116,7 @@ jobs:
           make pico_fido_wipe -j$(nproc)
 
       # =====================================================
-      # Upload Artifacts
+      # 6. Upload artifacts
       # =====================================================
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
