@@ -28,7 +28,7 @@ jobs:
       - name: Build and Package
         run: |
           # 定义版本号，模仿原脚本
-          VERSION="7.4"
+          VERSION="7.6"
           mkdir -p release
           
           # 定义要编译的板子列表
