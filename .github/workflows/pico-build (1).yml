@@ -1,0 +1,60 @@
+name: Build Yubikey5 test for Pico & Pico2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-fido:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential cmake
+
+      - name: Setup Pico SDK
+        run: |
+          git clone --depth 1 https://github.com/raspberrypi/pico-sdk.git $HOME/pico-sdk
+          cd $HOME/pico-sdk
+          git submodule update --init
+          echo "PICO_SDK_PATH=$HOME/pico-sdk" >> $GITHUB_ENV
+
+      - name: Build and Package
+        run: |
+          # 定义版本号，模仿原脚本
+          VERSION="7.4"
+          mkdir -p release
+          
+          # 定义要编译的板子列表
+          boards=("pico" "pico2")
+          
+          for board_name in "${boards[@]}"
+          do
+            echo "--- Building for $board_name ---"
+            mkdir -p build_$board_name
+            cd build_$board_name
+            
+            # 注入你的核心需求：-DVIDPID=Yubikey5
+            cmake .. \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DPICO_BOARD=$board_name \
+              -DVIDPID=Yubikey5
+            
+            make -j$(nproc)
+            
+            # 按照脚本逻辑移动并重命名产物
+            mv pico_fido.uf2 ../release/pico_fido_${board_name}_Yubikey5_v${VERSION}.uf2
+            cd ..
+          done
+
+      - name: Upload All Firmwares
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yubikey5-Pico-Firmwares
+          path: release/*.uf2
