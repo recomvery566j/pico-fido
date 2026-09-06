@@ -110,6 +110,27 @@ def test_get_assertion_allow_list_filtering_and_buffering(device):
 
     assert counts in [(1, 1), (l1, l2)]
 
+def test_get_next_assertion_rejects_a_different_channel(device):
+    rp = {"id": "channel.example.com", "name": "Channel test"}
+    for index in range(3):
+        device.doMC(rp=rp, rk=True, user={
+            "id": b"channel-user-" + bytes([index]),
+            "name": "Channel user",
+            "displayName": "Channel user"
+        })
+
+    result = device.GA(rp_id=rp["id"])["res"]
+    assert result.number_of_credentials == 3
+    old_cid = device.cid()
+    other_cid = (old_cid + 1) & 0xffffffff
+    device.set_cid(other_cid.to_bytes(4, "big"))
+    try:
+        with pytest.raises(CtapError) as e:
+            device.GNA()
+        assert e.value.code == CtapError.ERR.NOT_ALLOWED
+    finally:
+        device.set_cid(old_cid.to_bytes(4, "big"))
+
 def test_corrupt_credId(device, MCRes):
     # apply bit flip
     badid = list(MCRes['res'].attestation_object.auth_data.credential_data.credential_id[:])
@@ -217,6 +238,7 @@ def test_silent_ok(device, MCRes):
     res = device.GA(options={"up": False}, allow_list=[
             {"id": MCRes['res'].attestation_object.auth_data.credential_data.credential_id, "type": "public-key"}
         ])
+    assert (res['res'].auth_data.flags & (1 << 0)) == 0
 
 def test_silent_ko(device, MCRes):
     cred = MCRes['res'].attestation_object.auth_data.credential_data.credential_id + b'\x00'
@@ -230,4 +252,16 @@ def test_credential_resets(device, MCRes, GARes):
     device.reset()
     with pytest.raises(CtapError) as e:
         new_auth = device.doGA()
+    assert e.value.code == CtapError.ERR.NO_CREDENTIALS
+
+def test_get_assertion_after_reset_returns_no_credentials(device):
+    mc = device.doMC()
+    cred_id = mc['res'].attestation_object.auth_data.credential_data.credential_id
+
+    device.doGA(allow_list=[{"id": cred_id, "type": "public-key"}])
+    device.reset()
+
+    with pytest.raises(CtapError) as e:
+        device.GA(allow_list=[{"id": cred_id, "type": "public-key"}])
+
     assert e.value.code == CtapError.ERR.NO_CREDENTIALS

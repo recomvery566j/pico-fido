@@ -15,7 +15,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include "picokeys.h"
 #if defined(PICO_PLATFORM)
 #include "pico/stdlib.h"
 #endif
@@ -34,11 +34,14 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next);
 
 const uint8_t aaguid[16] = { 0x89, 0xFB, 0x94, 0xB7, 0x06, 0xC9, 0x36, 0x73, 0x9B, 0x7E, 0x30, 0x52, 0x6D, 0x96, 0x81, 0x45 }; // First 16 bytes of SHA256("Pico FIDO2")
 
-const uint8_t *cbor_data = NULL;
-size_t cbor_len = 0;
-uint8_t cbor_cmd = 0;
+static const uint8_t *volatile cbor_data = NULL;
+static volatile size_t cbor_len = 0;
+static volatile uint8_t cbor_cmd = 0;
 
 int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
+    pin_uv_auth_token_tick();
+    cbor_cred_mgmt_tick();
+    cbor_large_blobs_tick();
     if (len == 0 && cmd == CTAPHID_CBOR) {
         return CTAP1_ERR_INVALID_LEN;
     }
@@ -95,7 +98,7 @@ int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
     return CTAP1_ERR_INVALID_CMD;
 }
 
-void *cbor_thread(void *arg) __attribute__((unused));
+void *cbor_thread(void *arg);
 void *cbor_thread(void *arg) {
     (void)arg;
     card_init_core1();
@@ -108,12 +111,20 @@ void *cbor_thread(void *arg) {
         if (m == EV_EXIT) {
             break;
         }
-        apdu.sw = (uint16_t)cbor_parse(cbor_cmd, cbor_data, cbor_len);
+        const uint8_t *data = (const uint8_t *)cbor_data;
+        size_t len = cbor_len;
+        uint8_t cmd = cbor_cmd;
+        apdu.sw = (uint16_t)cbor_parse(cmd, data, len);
         if (apdu.sw == 0) {
             DEBUG_DATA(res_APDU, res_APDU_size);
         }
-        else {
-            if (apdu.sw >= CTAP1_ERR_INVALID_CHANNEL) {
+        if (apdu.sw != 0) {
+            if (cmd == CTAPHID_CBOR && len > 0) {
+                res_APDU[-1] = (uint8_t)apdu.sw;
+                res_APDU_size = 0;
+                apdu.sw = 0;
+            }
+            else if (apdu.sw > CTAP1_ERR_INVALID_CHANNEL) {
                 res_APDU[-1] = (uint8_t)apdu.sw;
                 apdu.sw = 0;
             }
@@ -183,33 +194,49 @@ static CborError COSE_key_params(int crv, int alg, mbedtls_ecp_group *grp, mbedt
 err:
     return error;
 }
-CborError COSE_key(mbedtls_ecp_keypair *key, CborEncoder *mapEncoderParent,
-                   CborEncoder *mapEncoder) {
-    int crv = mbedtls_curve_to_fido(key->grp.id), alg = 0;
-    if (key->grp.id == MBEDTLS_ECP_DP_SECP256R1) {
-        alg = FIDO2_ALG_ES256;
-    }
-    else if (key->grp.id == MBEDTLS_ECP_DP_SECP384R1) {
-        alg = FIDO2_ALG_ES384;
-    }
-    else if (key->grp.id == MBEDTLS_ECP_DP_SECP521R1) {
-        alg = FIDO2_ALG_ES512;
-    }
-    else if (key->grp.id == MBEDTLS_ECP_DP_SECP256K1) {
-        alg = FIDO2_ALG_ES256K;
-    }
-    else if (key->grp.id == MBEDTLS_ECP_DP_CURVE25519) {
-        alg = FIDO2_ALG_ECDH_ES_HKDF_256;
-    }
-#ifdef MBEDTLS_EDDSA_C
-    else if (key->grp.id == MBEDTLS_ECP_DP_ED25519) {
-        alg = FIDO2_ALG_EDDSA;
-    }
-    else if (key->grp.id == MBEDTLS_ECP_DP_ED448) {
-        alg = FIDO2_ALG_ED448;
-    }
-#endif
+CborError COSE_key(mbedtls_ecp_keypair *key, int alg, CborEncoder *mapEncoderParent, CborEncoder *mapEncoder) {
+    int crv = mbedtls_curve_to_fido(key->grp.id);
     return COSE_key_params(crv, alg, &key->grp, &key->Q, mapEncoderParent, mapEncoder);
+}
+
+CborError COSE_cached_key(const uint8_t *data, size_t data_len, CborEncoder *mapEncoderParent, CborEncoder *mapEncoder) {
+    if (!data || data_len == 0 || !mapEncoderParent || !mapEncoder) {
+        return CborErrorIllegalType;
+    }
+    CborParser parser;
+    CborValue value;
+    int64_t kty = 0;
+    int64_t alg = 0;
+    int64_t crv = 0;
+    CborByteString x = { 0 };
+    CborByteString y = { 0 };
+    CborError error = cbor_parser_init(data, data_len, 0, &parser, &value);
+    if (error == CborNoError) {
+        error = COSE_read_key(&value, &kty, &alg, &crv, &x, &y);
+    }
+    if (error != CborNoError || !x.present || x.len == 0) {
+        CBOR_FREE_BYTE_STRING(x);
+        CBOR_FREE_BYTE_STRING(y);
+        return error == CborNoError ? CborErrorImproperValue : error;
+    }
+    CBOR_CHECK(cbor_encoder_create_map(mapEncoderParent, mapEncoder, y.present ? 5 : 4));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, 1));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, kty));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, 3));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, alg));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, -1));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, crv));
+    CBOR_CHECK(cbor_encode_int(mapEncoder, -2));
+    CBOR_CHECK(cbor_encode_byte_string(mapEncoder, x.data, x.len));
+    if (y.present) {
+        CBOR_CHECK(cbor_encode_int(mapEncoder, -3));
+        CBOR_CHECK(cbor_encode_byte_string(mapEncoder, y.data, y.len));
+    }
+    CBOR_CHECK(cbor_encoder_close_container(mapEncoderParent, mapEncoder));
+err:
+    CBOR_FREE_BYTE_STRING(x);
+    CBOR_FREE_BYTE_STRING(y);
+    return error;
 }
 CborError COSE_key_shared(mbedtls_ecdh_context *key,
                           CborEncoder *mapEncoderParent,

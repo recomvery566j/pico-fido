@@ -21,24 +21,10 @@ set(USB_VID 0x2E8A)
 set(USB_PID 0x10FE)
 
 if(ESP_PLATFORM)
-    if(NOT DEFINED ENABLE_POWER_ON_RESET)
-        set(ENABLE_POWER_ON_RESET 0)
-    endif()
-    if(NOT DEFINED ENABLE_PQC)
-        set(ENABLE_PQC 0)
-    endif()
-    set(EXTRA_COMPONENT_DIRS
-        src/fido
-        pico-keys-sdk/config/esp32/components/pico-keys-sdk
-        pico-keys-sdk/config/esp32/components/tinycbor
-    )
-    if(ENABLE_PQC)
-        list(APPEND EXTRA_COMPONENT_DIRS
-            pico-keys-sdk/config/esp32/components/mlkem512
-            pico-keys-sdk/config/esp32/components/mlkem768
-            pico-keys-sdk/config/esp32/components/mlkem1024
-        )
-    endif()
+    set(ENABLE_EDDSA 1)
+    set(DEBUG_APDU 1)
+    set(ENABLE_DIAGNOSTICS 1)
+    set(PICOKEYS_COMPONENTS fido)
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 else()
     if(NOT ENABLE_EMULATION)
@@ -80,6 +66,22 @@ configure_bool_option(
     "OTP Application: \t\t disabled"
 )
 
+if(FORBID_DISABLE_AUV)
+    add_compile_definitions(FORBID_DISABLE_AUV=1)
+endif()
+if(DEFAULT_MCUV_NOT_REQUIRED)
+    add_compile_definitions(DEFAULT_MCUV_NOT_REQUIRED=1)
+endif()
+if(DEFAULT_PIN_POLICY)
+    add_compile_definitions(DEFAULT_PIN_POLICY=1)
+endif()
+if(MAX_PIN_RETRIES)
+    add_compile_definitions(MAX_PIN_RETRIES=${MAX_PIN_RETRIES})
+endif()
+if(FORCE_BUTTON_WAIT)
+    add_compile_definitions(FORCE_BUTTON_WAIT=1)
+endif()
+
 if(ENABLE_OTP_APP OR ENABLE_OATH_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
@@ -88,14 +90,17 @@ else()
 endif()
 
 set(USB_ITF_HID 1)
-include(pico-keys-sdk/pico_keys_sdk_import.cmake)
+include(pico-keys-sdk/picokeys_sdk_import.cmake)
 
 if(NOT ESP_PLATFORM)
-    set(SOURCES ${PICO_KEYS_SOURCES})
+    set(SOURCES ${PICOKEYS_SOURCES})
 endif()
 
 list(APPEND SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fido.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_authorization.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/resident_container.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/files.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cmd_register.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cmd_authenticate.c
@@ -112,6 +117,7 @@ list(APPEND SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cbor_cred_mgmt.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cbor_config.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cbor_vendor.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fido_vault.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cbor_large_blobs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/management.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/defs.c
@@ -119,12 +125,14 @@ list(APPEND SOURCES
 
 if(ENABLE_OATH_APP)
     list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/oath_container.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/oath.c
     )
 endif()
 
 if(ENABLE_OTP_APP)
     list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp_container.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp.c
     )
 endif()
@@ -147,7 +155,7 @@ if(NOT ESP_PLATFORM)
     )
     target_compile_options(pico_fido PRIVATE ${COMMON_COMPILE_OPTIONS})
 
-    pico_keys_apply_strict_flags(
+    picokeys_apply_strict_flags(
         SOURCES ${SOURCES}
         FILTER_REGEX "/src/fido/|/pico-keys-sdk/src/|/pico-keys-sdk/config/"
     )
@@ -162,6 +170,7 @@ if(NOT ESP_PLATFORM)
     endif()
 
     if(ENABLE_EMULATION)
+        enable_testing()
         if(NOT MSVC)
             set(EMULATION_NON_MSVC_COMPILE_OPTIONS
                 -fdata-sections
@@ -186,19 +195,106 @@ if(NOT ESP_PLATFORM)
                 target_compile_options(pico_fido PRIVATE ${DEBUG_APDU_SANITIZER_OPTIONS})
                 target_link_options(pico_fido PRIVATE ${DEBUG_APDU_SANITIZER_OPTIONS})
             endif()
-        else()
+        elseif(NOT MSVC)
             set(EMULATION_NON_APPLE_LINK_OPTIONS
                 -Wl,--gc-sections
             )
             target_link_options(pico_fido PRIVATE ${EMULATION_NON_APPLE_LINK_OPTIONS})
         endif()
 
-        target_link_libraries(pico_fido PRIVATE pico_keys_sdk mbedtls pthread m)
+        target_link_libraries(pico_fido PRIVATE picokeys_sdk mbedtls)
+        if(NOT MSVC)
+            target_link_libraries(pico_fido PRIVATE pthread m)
+        endif()
+
+        add_executable(fido_object_provider_test
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_crypto_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/tests/fido_object_provider_test.c
+        )
+        target_include_directories(fido_object_provider_test PRIVATE ${INCLUDES})
+        if(MSVC)
+            target_compile_options(fido_object_provider_test PRIVATE /W4 /WX)
+        else()
+            target_compile_options(fido_object_provider_test PRIVATE -Wall -Wextra -Werror)
+        endif()
+        target_link_libraries(fido_object_provider_test PRIVATE mbedtls)
+        add_test(NAME fido_object_provider_test COMMAND fido_object_provider_test)
+
+        add_executable(fido_object_authorization_test
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_authorization.c
+            ${CMAKE_CURRENT_LIST_DIR}/tests/fido_object_authorization_test.c
+        )
+        target_include_directories(fido_object_authorization_test PRIVATE ${INCLUDES})
+        if(MSVC)
+            target_compile_options(fido_object_authorization_test PRIVATE /W4 /WX)
+        else()
+            target_compile_options(fido_object_authorization_test PRIVATE -Wall -Wextra -Werror)
+        endif()
+        target_link_libraries(fido_object_authorization_test PRIVATE mbedtls)
+        add_test(NAME fido_object_authorization_test COMMAND fido_object_authorization_test)
+
+        add_executable(fido_resident_container_test
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_container.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_container_store.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_crypto_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_policy.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_store_txn.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/resident_container.c
+            ${CMAKE_CURRENT_LIST_DIR}/tests/fido_resident_container_test.c
+        )
+        target_include_directories(fido_resident_container_test PRIVATE ${INCLUDES})
+        if(MSVC)
+            target_compile_options(fido_resident_container_test PRIVATE /W4 /WX)
+        else()
+            target_compile_options(fido_resident_container_test PRIVATE -Wall -Wextra -Werror)
+        endif()
+        target_link_libraries(fido_resident_container_test PRIVATE mbedtls)
+        add_test(NAME fido_resident_container_test COMMAND fido_resident_container_test)
+
+        add_executable(fido_oath_container_test
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_container.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_container_store.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_crypto_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_policy.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_store_txn.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/oath_container.c
+            ${CMAKE_CURRENT_LIST_DIR}/tests/fido_oath_container_test.c
+        )
+        target_include_directories(fido_oath_container_test PRIVATE ${INCLUDES})
+        if(MSVC)
+            target_compile_options(fido_oath_container_test PRIVATE /W4 /WX)
+        else()
+            target_compile_options(fido_oath_container_test PRIVATE -Wall -Wextra -Werror)
+        endif()
+        target_link_libraries(fido_oath_container_test PRIVATE mbedtls)
+        add_test(NAME fido_oath_container_test COMMAND fido_oath_container_test)
+
+        add_executable(fido_otp_container_test
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_container.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_container_store.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_crypto_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_policy.c
+            ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/fs/object_store_txn.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp_container.c
+            ${CMAKE_CURRENT_LIST_DIR}/tests/fido_otp_container_test.c
+        )
+        target_include_directories(fido_otp_container_test PRIVATE ${INCLUDES})
+        if(MSVC)
+            target_compile_options(fido_otp_container_test PRIVATE /W4 /WX)
+        else()
+            target_compile_options(fido_otp_container_test PRIVATE -Wall -Wextra -Werror)
+        endif()
+        target_link_libraries(fido_otp_container_test PRIVATE mbedtls)
+        add_test(NAME fido_otp_container_test COMMAND fido_otp_container_test)
     else()
         target_link_libraries(
             pico_fido
             PRIVATE
-                pico_keys_sdk
+                picokeys_sdk
                 pico_stdlib
                 pico_multicore
                 hardware_flash
